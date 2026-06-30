@@ -109,6 +109,31 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         # Must be False so that drafter kv cache isn't merged with verifier's
         return False
 
+    @classmethod
+    def _find_cache_kv_group_id(cls, kv_cache_config) -> int:
+        if kv_cache_config is None:
+            return 0
+        from vllm.v1.kv_cache_interface import HiddenStateCacheSpec
+        group_ids = [
+            gid
+            for gid, group in enumerate(kv_cache_config.kv_cache_groups)
+            if isinstance(group.kv_cache_spec, HiddenStateCacheSpec)
+        ]
+        if len(group_ids) == 1:
+            return group_ids[0]
+        if not group_ids and len(kv_cache_config.kv_cache_groups) == 1:
+            return 0
+        raise ValueError(
+            "Could not uniquely identify the extract-hidden-states KV cache "
+            f"group from {len(kv_cache_config.kv_cache_groups)} groups."
+        )
+
+    @staticmethod
+    def _get_cache_block_size(vllm_config, kv_cache_config, group_id: int) -> int:
+        if kv_cache_config is None:
+            return vllm_config.cache_config.block_size
+        return kv_cache_config.kv_cache_groups[group_id].kv_cache_spec.block_size
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -120,7 +145,14 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             role=role,
             kv_cache_config=kv_cache_config,
         )
-        self._block_size = vllm_config.cache_config.block_size
+        self._cache_kv_group_id = self._find_cache_kv_group_id(kv_cache_config)
+        self._block_size = self._get_cache_block_size(
+            vllm_config, kv_cache_config, self._cache_kv_group_id
+        )
+        logger.info(
+            "ExampleHiddenStatesConnector role=%s hs_group=%d block_size=%d",
+            role, self._cache_kv_group_id, self._block_size,
+        )
         self._storage_path = self._kv_transfer_config.get_from_extra_config(
             "shared_storage_path", "/tmp"
         )
@@ -150,7 +182,6 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
 
         # Worker-side state (set by register_kv_caches).
         self._kv_cache: torch.Tensor | None = None
-        self._hs_group_idx: int = 0
         # Only TP rank 0 writes hidden states to disk; other TP ranks no-op.
         # Set in register_kv_caches (after distributed init).
         self._is_tp_rank_zero: bool = True
@@ -264,7 +295,7 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         if self._kv_cache_config is not None:
             for i, group in enumerate(self._kv_cache_config.kv_cache_groups):
                 if self.cache_layers[0] in group.layer_names:
-                    self._hs_group_idx = i
+                    self._cache_kv_group_id = i
                     break
 
     @staticmethod
@@ -470,7 +501,10 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         the hidden states from the KV cache.
         """
         req_id = request.request_id
-        filename = self._request_filenames.pop(req_id)
+        filename = self._request_filenames.pop(req_id, None)
+        if filename is None:
+            logger.warning("No filename for req %s, skipping save", req_id)
+            return False, None
         kv_params = request.kv_transfer_params or {}
         if kv_params.get("include_output_tokens", False):
             # Exclude the final token — it was the model's output, never an
@@ -536,7 +570,7 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         request: "Request",
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
-        return self.request_finished(request, block_ids[self._hs_group_idx])
+        return self.request_finished(request, block_ids[self._cache_kv_group_id])
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> str | None:

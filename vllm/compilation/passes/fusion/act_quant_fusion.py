@@ -30,9 +30,9 @@ FP4_DTYPE = torch.uint8
 
 SILU_MUL_OP = torch.ops._C.silu_and_mul.default
 
-FUSED_OPS: dict[QuantKey, OpOverload] = {
-    kFp8StaticTensorSym: torch.ops._C.silu_and_mul_quant.default,  # noqa: E501
-}
+FUSED_OPS: dict[QuantKey, OpOverload] = {}
+if hasattr(torch.ops._C, "silu_and_mul_quant"):
+    FUSED_OPS[kFp8StaticTensorSym] = torch.ops._C.silu_and_mul_quant.default
 silu_and_mul_nvfp4_quant_supported = current_platform.is_cuda() and hasattr(
     torch.ops._C, "silu_and_mul_nvfp4_quant"
 )

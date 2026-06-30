@@ -145,6 +145,20 @@ class ExtractHiddenStatesProposer:
         if num_tokens_across_dp is not None:
             num_tokens_across_dp[self.dp_rank] = num_input_tokens
 
+        # For hybrid models (e.g. gpt-oss with alternating sliding window),
+        # the hidden-states cache group has a different block_size and block
+        # table than the main attention group.  Use the per-layer slot_mappings
+        # when available so the cache-only layer writes to the correct slots.
+        if (
+            slot_mappings is not None
+            and not isinstance(slot_mappings, list)
+            and self.attn_layer_names
+            and self.attn_layer_names[0] in slot_mappings
+        ):
+            hs_slot_mapping = slot_mappings[self.attn_layer_names[0]]
+        else:
+            hs_slot_mapping = common_attn_metadata.slot_mapping
+
         with set_forward_context(
             per_layer_attn_metadata,
             self.vllm_config,
@@ -152,7 +166,7 @@ class ExtractHiddenStatesProposer:
             num_tokens_across_dp=num_tokens_across_dp,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             slot_mapping=self._get_slot_mapping(
-                num_input_tokens, common_attn_metadata.slot_mapping
+                num_input_tokens, hs_slot_mapping
             ),
         ):
             self.model(
