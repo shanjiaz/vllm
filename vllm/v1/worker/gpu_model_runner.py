@@ -268,9 +268,13 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         vocab_size: int,
         routed_experts: RoutedExpertsTensors | None = None,
         check_ep_fault: bool = False,
+        opd_teacher_logprobs: list[list[float]] | None = None,
+        opd_draft_token_ids: list[list[int]] | None = None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
+        self._opd_teacher_logprobs = opd_teacher_logprobs
+        self._opd_draft_token_ids = opd_draft_token_ids
 
         # Event on the copy stream so we can synchronize the non-blocking copy.
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
@@ -339,6 +343,9 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         if self._routed_experts_cpu is not None:
             output.routed_experts = self._routed_experts_cpu.tolists()
         del self._routed_experts
+
+        output.opd_teacher_logprobs = self._opd_teacher_logprobs
+        output.opd_draft_token_ids = self._opd_draft_token_ids
 
         if self._has_fault is not None and self._has_fault.item():
             mask = get_ep_all2all_manager().query_active_mask()
@@ -3734,6 +3741,8 @@ class GPUModelRunner(
         list[str],
         dict[str, int],
         list[int],
+        list[list[float]] | None,
+        list[list[int]] | None,
     ]:
         num_nans_in_logits = {}
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
@@ -3858,6 +3867,8 @@ class GPUModelRunner(
             req_ids_output_copy,
             req_id_to_index_output_copy,
             invalid_req_indices,
+            sampler_output.opd_teacher_logprobs,
+            sampler_output.opd_draft_token_ids,
         )
 
     @contextmanager
@@ -4710,6 +4721,8 @@ class GPUModelRunner(
                 req_ids_output_copy,
                 req_id_to_index_output_copy,
                 invalid_req_indices,
+                opd_teacher_logprobs,
+                opd_draft_token_ids,
             ) = self._bookkeeping_sync(
                 scheduler_output,
                 sampler_output,
@@ -4765,6 +4778,8 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
+                opd_teacher_logprobs=opd_teacher_logprobs,
+                opd_draft_token_ids=opd_draft_token_ids,
             )
 
         if not self.use_async_scheduling:
@@ -4806,6 +4821,8 @@ class GPUModelRunner(
                 vocab_size=self.input_batch.vocab_size,
                 routed_experts=routed_experts_snapshot,
                 check_ep_fault=self.check_ep_fault,
+                opd_teacher_logprobs=opd_teacher_logprobs,
+                opd_draft_token_ids=opd_draft_token_ids,
             )
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"
@@ -5599,6 +5616,132 @@ class GPUModelRunner(
 
         self.reset_encoder_cache()
         self.reset_mm_cache()
+
+    def reload_draft_weights(self, weights_path: str) -> None:
+        draft_model = self.get_draft_model()
+        if draft_model is None:
+            raise RuntimeError("No draft model configured")
+
+        import os
+
+        import regex as re
+        from safetensors.torch import load_file
+
+        from vllm.distributed.parallel_state import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
+
+        sf_path = os.path.join(weights_path, "model.safetensors")
+        hf_weights = load_file(sf_path, device="cpu")
+
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_tensor_model_parallel_world_size()
+
+        model_state = dict(draft_model.named_parameters())
+
+        layer_offset = 0
+        for name in model_state:
+            m = re.search(r"model\.layers\.(\d+)\.", name)
+            if m:
+                layer_offset = int(m.group(1))
+                break
+
+        def _tp_slice(full_tensor: torch.Tensor, dim: int) -> torch.Tensor:
+            if tp_size <= 1:
+                return full_tensor
+            chunk_size = full_tensor.shape[dim] // tp_size
+            return full_tensor.narrow(
+                dim, tp_rank * chunk_size, chunk_size
+            ).contiguous()
+
+        # Column-parallel: split output dim (dim=0)
+        _COL_PARALLEL = {
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "qkv_proj",
+            "gate_proj",
+            "up_proj",
+            "gate_up_proj",
+        }
+        # Row-parallel: split input dim (dim=1)
+        _ROW_PARALLEL = {"o_proj", "down_proj"}
+
+        def _shard_weight(name: str, weight: torch.Tensor) -> torch.Tensor:
+            for pat in _COL_PARALLEL:
+                if f".{pat}.weight" in name:
+                    return _tp_slice(weight, dim=0)
+            for pat in _ROW_PARALLEL:
+                if f".{pat}.weight" in name:
+                    return _tp_slice(weight, dim=1)
+            if "embed_tokens.weight" in name or "lm_head.weight" in name:
+                return _tp_slice(weight, dim=0)
+            return weight
+
+        loaded = set()
+        for vllm_name, param in model_state.items():
+            if vllm_name in hf_weights:
+                w = _shard_weight(vllm_name, hf_weights[vllm_name])
+                param.data.copy_(w.to(param.dtype))
+                loaded.add(vllm_name)
+                continue
+
+            hf_name = vllm_name
+            if hf_name.startswith("model."):
+                hf_name = hf_name[len("model.") :]
+            m = re.match(r"(layers\.)(\d+)(\..*)", hf_name)
+            if m:
+                vllm_idx = int(m.group(2))
+                hf_idx = vllm_idx - layer_offset
+                hf_name = f"{m.group(1)}{hf_idx}{m.group(3)}"
+
+            if ".qkv_proj.weight" in hf_name:
+                base = hf_name.replace(".qkv_proj.weight", "")
+                q = hf_weights.get(f"{base}.q_proj.weight")
+                k = hf_weights.get(f"{base}.k_proj.weight")
+                v = hf_weights.get(f"{base}.v_proj.weight")
+                if q is not None and k is not None and v is not None:
+                    stacked = torch.cat(
+                        [
+                            _tp_slice(q, 0),
+                            _tp_slice(k, 0),
+                            _tp_slice(v, 0),
+                        ],
+                        dim=0,
+                    )
+                    param.data.copy_(stacked.to(param.dtype))
+                    loaded.add(vllm_name)
+                    continue
+            if ".gate_up_proj.weight" in hf_name:
+                base = hf_name.replace(".gate_up_proj.weight", "")
+                gate = hf_weights.get(f"{base}.gate_proj.weight")
+                up = hf_weights.get(f"{base}.up_proj.weight")
+                if gate is not None and up is not None:
+                    stacked = torch.cat(
+                        [
+                            _tp_slice(gate, 0),
+                            _tp_slice(up, 0),
+                        ],
+                        dim=0,
+                    )
+                    param.data.copy_(stacked.to(param.dtype))
+                    loaded.add(vllm_name)
+                    continue
+
+            if hf_name in hf_weights:
+                w = _shard_weight(hf_name, hf_weights[hf_name])
+                param.data.copy_(w.to(param.dtype))
+                loaded.add(vllm_name)
+
+        logger.info(
+            "Draft weights reloaded from %s (%d/%d params, tp_rank=%d/%d)",
+            weights_path,
+            len(loaded),
+            len(model_state),
+            tp_rank,
+            tp_size,
+        )
 
     def _get_prompt_logprobs_dict(
         self,

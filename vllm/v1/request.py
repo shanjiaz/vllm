@@ -124,10 +124,16 @@ class Request:
                 self.kv_cache_report_mode = sampling_params.extra_args.get(
                     "kv_cache_report_mode", "incremental"
                 )
+                self.return_opd_metadata: bool = bool(
+                    sampling_params.extra_args.get("return_opd_metadata", False)
+                )
             else:
                 self.kv_cache_report_mode = "incremental"
+                self.return_opd_metadata = False
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
+
+        self.opd_rounds: list[dict[str, Any]] = []
 
         self.prompt_token_ids = prompt_token_ids
         self.prompt_embeds = prompt_embeds

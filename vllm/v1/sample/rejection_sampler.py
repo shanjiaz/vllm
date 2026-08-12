@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
 from vllm.logger import init_logger
@@ -152,6 +153,13 @@ class RejectionSampler(nn.Module):
         raw_target_logits = logits[target_logits_indices]
         # Use float32 for the target_logits.
         raw_target_logits = raw_target_logits.to(torch.float32)
+
+        opd_draft_teacher_lps = (
+            F.log_softmax(raw_target_logits, dim=-1)
+            .gather(-1, metadata.draft_token_ids.long().unsqueeze(-1))
+            .squeeze(-1)
+        )
+
         target_logits = raw_target_logits
         if not self.is_processed_logprobs_mode:
             # Clone raw_target_logits before applying processors to preserve
@@ -184,6 +192,18 @@ class RejectionSampler(nn.Module):
             use_fp64_gumbel=self.use_fp64_gumbel,
         )
 
+        flat_lps = opd_draft_teacher_lps.tolist()
+        flat_draft_ids = metadata.draft_token_ids.tolist()
+        opd_teacher_logprobs: list[list[float]] = []
+        opd_draft_token_ids: list[list[int]] = []
+        lp_offset = 0
+        for n in metadata.num_draft_tokens:
+            opd_teacher_logprobs.append(flat_lps[lp_offset : lp_offset + n])
+            opd_draft_token_ids.append(
+                [int(x) for x in flat_draft_ids[lp_offset : lp_offset + n]]
+            )
+            lp_offset += n
+
         logprobs_tensors = None
         if sampling_metadata.max_num_logprobs is not None:
             logprobs_tensors = self._get_logprobs_tensors(
@@ -198,6 +218,8 @@ class RejectionSampler(nn.Module):
         return SamplerOutput(
             sampled_token_ids=output_token_ids,
             logprobs_tensors=logprobs_tensors,
+            opd_teacher_logprobs=opd_teacher_logprobs,
+            opd_draft_token_ids=opd_draft_token_ids,
         )
 
     def _get_logprobs_tensors(

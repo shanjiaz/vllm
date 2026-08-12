@@ -217,6 +217,8 @@ class SamplerOutput:
     # PLACEHOLDER_TOKEN_ID (-1 by default) is used for padding.
     sampled_token_ids: torch.Tensor
     logprobs_tensors: LogprobsTensors | None
+    opd_teacher_logprobs: list[list[float]] | None = None
+    opd_draft_token_ids: list[list[int]] | None = None
 
 
 @dataclass
@@ -306,6 +308,9 @@ class ModelRunnerOutput:
     # its slot buffer via ``slot_buffer[slot_mapping] = routing_data``.
     # ``None`` when ``enable_return_routed_experts`` is off.
     routed_experts: RoutedExpertsLists | None = None
+
+    opd_teacher_logprobs: list[list[float]] | None = None
+    opd_draft_token_ids: list[list[int]] | None = None
 
     @staticmethod
     def with_kv_conn_output_only(

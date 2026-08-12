@@ -184,6 +184,24 @@ async def start_draft_weight_update(raw_request: Request):
     return JSONResponse(content={"message": "Draft weight update started"})
 
 
+@router.post("/reload_draft_weights")
+async def reload_draft_weights(raw_request: Request):
+    try:
+        body = await raw_request.json()
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON format") from e  # noqa: B904
+    weights_path = body.get("weights_path")
+    if not weights_path:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="Missing 'weights_path' in request body",
+        )
+    await engine_client(raw_request).collective_rpc(
+        "reload_draft_weights", kwargs={"weights_path": weights_path}
+    )
+    return JSONResponse(content={"message": "Draft weights reloaded"})
+
+
 @router.post("/update_weights")
 async def update_weights(raw_request: Request):
     try:

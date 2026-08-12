@@ -1791,6 +1791,28 @@ class Scheduler(SchedulerInterface):
                     request_id=req_id,
                 )
 
+                if (
+                    request.return_opd_metadata
+                    and not output_is_stale
+                    and model_runner_output.opd_teacher_logprobs is not None
+                ):
+                    teacher_lps = model_runner_output.opd_teacher_logprobs[req_index]
+                    actual_draft_ids = (
+                        model_runner_output.opd_draft_token_ids[req_index]
+                        if model_runner_output.opd_draft_token_ids is not None
+                        else list(scheduled_spec_token_ids)
+                    )
+                    if teacher_lps:
+                        request.opd_rounds.append(
+                            {
+                                "response_offset": len(request._output_token_ids),
+                                "num_draft": num_draft_tokens,
+                                "num_accepted": num_accepted,
+                                "draft_token_ids": actual_draft_ids,
+                                "teacher_logprobs": teacher_lps,
+                            }
+                        )
+
             # Free encoder inputs only after the step has actually executed.
             if request.has_encoder_inputs:
                 self._free_encoder_inputs(request)
@@ -1912,6 +1934,10 @@ class Scheduler(SchedulerInterface):
                 finished = self._handle_stopped_request(request)
                 if finished:
                     kv_transfer_params, ec_transfer_params = self._free_request(request)
+                    if request.opd_rounds:
+                        if kv_transfer_params is None:
+                            kv_transfer_params = {}
+                        kv_transfer_params["opd_rounds"] = request.opd_rounds
 
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
