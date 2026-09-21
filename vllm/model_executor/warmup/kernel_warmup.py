@@ -205,7 +205,7 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
             worker.scheduler_config.max_num_batched_tokens,
         )
 
-    if current_platform.has_device_capability(90):
+    if enable_jit_warmup and current_platform.has_device_capability(90):
         _warmup_ll_bf16_router_gemm(worker.get_model())
 
     _warmup_kimi_k3_gemm_rs_ar()

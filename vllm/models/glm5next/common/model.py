@@ -701,7 +701,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         return self.embed_tokens(input_ids)
 
     @staticmethod
-    def _capture_aux_hidden_stream(
+    def _capture_aux_hidden_boundary(
         layer: Glm5NextDecoderLayer,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
@@ -745,12 +745,23 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             hidden_states = sp_shard(hidden_states)
 
         aux_hidden_states: list[torch.Tensor] = []
+
+        # Auxiliary layer indices refer to layer boundaries: layer 0 is the
+        # embedding output, and layer N is the output after layer N - 1.
+        # Capture the embedding boundary on the first PP rank to match the
+        # standard Eagle3 extraction convention.
+        if (
+            get_pp_group().is_first_rank
+            and 0 in self.aux_hidden_state_layers
+        ):
+            aux_hidden_states.append(hidden_states)
+
         for layer_idx, layer in enumerate(
             self._active_layers, start=self.start_layer
         ):
             if layer_idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(
-                    self._capture_aux_hidden_stream(
+                    self._capture_aux_hidden_boundary(
                         layer, hidden_states, residual, post, comb
                     )
                 )

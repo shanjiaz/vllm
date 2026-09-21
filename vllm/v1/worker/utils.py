@@ -30,6 +30,7 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
+    HiddenStateCacheSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheLayout,
@@ -154,7 +155,14 @@ class KVBlockZeroer:
 
         for group in attn_groups_iter:
             spec = group.kv_cache_spec
-            if not isinstance(spec, AttentionSpec):
+            # Connector-owned hidden-state caches are fully overwritten for
+            # produced tokens and are not consumed by attention kernels.
+            # They may alias a native model cache allocation with a different
+            # logical stride, so including them in the attention block zeroer
+            # would create conflicting metadata for the same base pointer.
+            if not isinstance(spec, AttentionSpec) or isinstance(
+                spec, HiddenStateCacheSpec
+            ):
                 continue
             if group.kv_cache_group_id >= len(kernel_block_sizes):
                 continue

@@ -1200,6 +1200,11 @@ def _get_kv_cache_groups_glm5_next(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec] | None:
     """Build GLM-5.3-Flash groups with Mamba/MLA and tail/indexer aliasing."""
+    hidden_specs = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if isinstance(spec, HiddenStateCacheSpec)
+    }
     mamba_specs = {
         name: spec
         for name, spec in kv_cache_spec.items()
@@ -1213,7 +1218,7 @@ def _get_kv_cache_groups_glm5_next(
     attn_specs = {
         name: spec
         for name, spec in kv_cache_spec.items()
-        if not isinstance(spec, (MambaSpec, KpoolTailSpec))
+        if not isinstance(spec, (MambaSpec, KpoolTailSpec, HiddenStateCacheSpec))
     }
     if not mamba_specs or not all(
         type(spec) is MLAAttentionSpec for spec in attn_specs.values()
@@ -1270,11 +1275,18 @@ def _get_kv_cache_groups_glm5_next(
     for index, name in enumerate(mamba_specs):
         mamba_grouped_names[index % num_groups].append(name)
 
-    return (
+    groups = (
         [KVCacheGroupSpec(list(attn_specs), uniform_spec)]
         + ([tail_group] if tail_group is not None else [])
         + create_kv_cache_group_specs(padded_specs, mamba_grouped_names)
     )
+    # Hidden-state extraction owns a separate block table. Keep those cache
+    # specs out of GLM5's native MLA/indexer classification, then append them
+    # as independent groups just as the generic grouping path does.
+    groups += [
+        KVCacheGroupSpec([name], spec) for name, spec in hidden_specs.items()
+    ]
+    return groups
 
 
 def _glm5_next_tensor_layout(
@@ -1301,6 +1313,11 @@ def _glm5_next_tensor_layout(
     mamba_groups = [
         group for group in kv_cache_groups if isinstance(group.kv_cache_spec, MambaSpec)
     ]
+    hidden_groups = [
+        group
+        for group in kv_cache_groups
+        if isinstance(group.kv_cache_spec, HiddenStateCacheSpec)
+    ]
     attn_group: KVCacheGroupSpec | None = None
     tail_group: KVCacheGroupSpec | None = None
     for group in uniform_groups:
@@ -1311,7 +1328,10 @@ def _glm5_next_tensor_layout(
             tail_group = group
     if attn_group is None or not mamba_groups:
         return None
-    if len(uniform_groups) + len(mamba_groups) != len(kv_cache_groups):
+    if (
+        len(uniform_groups) + len(mamba_groups) + len(hidden_groups)
+        != len(kv_cache_groups)
+    ):
         return None
 
     attn_uniform = cast(UniformTypeKVCacheSpecs, attn_group.kv_cache_spec)
@@ -1594,7 +1614,16 @@ def _get_kv_cache_bytes_per_block(
     """Return the largest cache group's bytes per block."""
     if (glm5_layout := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
         _, _, mla_names, idx_names, mla_page, idx_page, _, _ = glm5_layout
-        return len(mla_names) * mla_page + len(idx_names) * idx_page
+        native_bytes = len(mla_names) * mla_page + len(idx_names) * idx_page
+        hidden_bytes = max(
+            (
+                group.kv_cache_spec.page_size_bytes
+                for group in kv_cache_groups
+                if isinstance(group.kv_cache_spec, HiddenStateCacheSpec)
+            ),
+            default=0,
+        )
+        return max(native_bytes, hidden_bytes)
 
     bytes_per_block = max(
         sum(
@@ -1702,7 +1731,7 @@ def get_kv_cache_config_from_groups(
             tail_names,
             _,
         ) = glm5_layout
-        bytes_per_block = len(mla_names) * mla_page + len(idx_names) * idx_page
+        bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups)
         num_blocks = may_override_num_blocks(
             vllm_config, available_memory // bytes_per_block
         )
@@ -1744,6 +1773,11 @@ def get_kv_cache_config_from_groups(
                     UniformTypeKVCacheSpecs, tail_group.kv_cache_spec
                 ).kv_cache_specs
                 add_tensor(tail_name, tail_specs[tail_name], offset)
+
+        for group in kv_cache_groups:
+            if isinstance(group.kv_cache_spec, HiddenStateCacheSpec):
+                for layer_name in group.layer_names:
+                    add_tensor(layer_name, group.kv_cache_spec, 0)
 
         return KVCacheConfig(
             num_blocks=num_blocks,
