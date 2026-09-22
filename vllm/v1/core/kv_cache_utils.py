@@ -1615,15 +1615,17 @@ def _get_kv_cache_bytes_per_block(
     if (glm5_layout := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
         _, _, mla_names, idx_names, mla_page, idx_page, _, _ = glm5_layout
         native_bytes = len(mla_names) * mla_page + len(idx_names) * idx_page
-        hidden_bytes = max(
-            (
-                group.kv_cache_spec.page_size_bytes
-                for group in kv_cache_groups
-                if isinstance(group.kv_cache_spec, HiddenStateCacheSpec)
-            ),
-            default=0,
+        # Hidden-state extraction writes through its own independently managed
+        # block table. It therefore cannot alias the native GLM cache region:
+        # with concurrent requests, the same numeric block id may be live in
+        # the two groups for different requests. Reserve a disjoint physical
+        # page for every hidden-state group.
+        hidden_bytes = sum(
+            group.kv_cache_spec.page_size_bytes
+            for group in kv_cache_groups
+            if isinstance(group.kv_cache_spec, HiddenStateCacheSpec)
         )
-        return max(native_bytes, hidden_bytes)
+        return native_bytes + hidden_bytes
 
     bytes_per_block = max(
         sum(
@@ -1774,10 +1776,16 @@ def get_kv_cache_config_from_groups(
                 ).kv_cache_specs
                 add_tensor(tail_name, tail_specs[tail_name], offset)
 
+        hidden_offset = (
+            len(mla_names) * mla_page + len(idx_names) * idx_page
+        ) * num_blocks
         for group in kv_cache_groups:
             if isinstance(group.kv_cache_spec, HiddenStateCacheSpec):
                 for layer_name in group.layer_names:
-                    add_tensor(layer_name, group.kv_cache_spec, 0)
+                    add_tensor(layer_name, group.kv_cache_spec, hidden_offset)
+                hidden_offset += (
+                    group.kv_cache_spec.page_size_bytes * num_blocks
+                )
 
         return KVCacheConfig(
             num_blocks=num_blocks,

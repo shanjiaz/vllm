@@ -2605,6 +2605,43 @@ def test_get_kv_cache_config_balanced_mamba_hybrid():
     ) == pytest.approx(100 / blocks_per_request)
 
 
+def test_glm5_hidden_state_cache_uses_disjoint_storage():
+    """Independent block tables must not alias the same physical bytes."""
+    model_config = ModelConfig(max_model_len=8192)
+    vllm_config = VllmConfig(model_config=model_config)
+    kv_cache_spec, _ = _glm5_like_kv_cache_spec()
+    hidden_name = "cache_only_layers.0"
+    kv_cache_spec[hidden_name] = HiddenStateCacheSpec(
+        block_size=16,
+        num_kv_heads=7,
+        head_size=4096,
+        dtype=torch.bfloat16,
+    )
+
+    groups = kv_cache_utils.get_kv_cache_groups(vllm_config, kv_cache_spec)
+    bytes_per_block = kv_cache_utils._get_kv_cache_bytes_per_block(groups)
+    native_bytes = 11 * kv_cache_spec["layers.3.attn"].page_size_bytes + 11 * (
+        kv_cache_spec["layers.3.indexer"].page_size_bytes
+    )
+    hidden_bytes = kv_cache_spec[hidden_name].page_size_bytes
+    assert bytes_per_block == native_bytes + hidden_bytes
+
+    num_blocks = 10
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config, groups, bytes_per_block * num_blocks
+    )
+    assert config.num_blocks == num_blocks
+    tensors = _tensor_by_layer(config)
+    hidden_tensor = tensors[hidden_name]
+    assert hidden_tensor.offset == native_bytes * num_blocks
+    assert hidden_tensor.offset >= max(
+        tensor.offset + tensor.layer_stride
+        for name, tensor in tensors.items()
+        if name != hidden_name
+    )
+    assert hidden_tensor.offset + hidden_bytes * num_blocks <= hidden_tensor.size
+
+
 def test_get_kv_cache_config_kpool_tail_coowns_indexer_tensor():
     """The kpool tail parasitizes the indexer tensors instead of getting its
     own: sibling idx/tail tensors paired by layer order, zero standalone tail
