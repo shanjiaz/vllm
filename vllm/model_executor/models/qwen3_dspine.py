@@ -120,17 +120,24 @@ class AdjacentCausalInjection(nn.Module):
         return receiver_states + rms * update.to(receiver_states.dtype)
 
     def forward(
-        self, layer_idx: int, pre_injection_states: torch.Tensor
+        self,
+        layer_idx: int,
+        pre_injection_states: torch.Tensor,
+        *,
+        anchor_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        blocks = pre_injection_states.reshape(
-            -1, self.block_size, self.hidden_size
-        )
+        blocks = pre_injection_states.reshape(-1, self.block_size, self.hidden_size)
         features = self.project(layer_idx, blocks)
+        predecessor = features[:, :-1]
+        if anchor_features is not None:
+            predecessor = torch.cat(
+                (anchor_features[:, None, :], predecessor[:, 1:]), dim=1
+            )
         successors = self.write(
             layer_idx,
             blocks[:, 1:],
             features[:, 1:],
-            features[:, :-1],
+            predecessor,
         )
         return torch.cat((blocks[:, :1], successors), dim=1).reshape_as(
             pre_injection_states
@@ -155,13 +162,9 @@ def _score_transitions(
         ),
         dim=1,
     )
-    predecessor_features = injection.token_features(
-        transfer_codebook, predecessor_ids
-    )
+    predecessor_features = injection.token_features(transfer_codebook, predecessor_ids)
     receiver_features = injection.project(final_layer_idx, final_pre_injection)
-    receiver_states = final_pre_injection[:, :, None, :].expand(
-        -1, -1, top_k, -1
-    )
+    receiver_states = final_pre_injection[:, :, None, :].expand(-1, -1, top_k, -1)
     refined = injection.write(
         final_layer_idx,
         receiver_states,
@@ -200,6 +203,7 @@ class DSpineQwen3Model(DFlashQwen3Model):
         if transfer_dim > self.config.hidden_size:
             raise ValueError("DSpine transfer_dim cannot exceed hidden_size.")
         self.transition_top_k = int(draft_config["transition_top_k"])
+        self.known_anchor_injection = draft_config.get("known_anchor_injection", False)
         self.injection = AdjacentCausalInjection(
             hidden_size=self.config.hidden_size,
             transfer_dim=transfer_dim,
@@ -230,6 +234,11 @@ class DSpineQwen3Model(DFlashQwen3Model):
             input_embeds = self.embed_input_ids(input_ids)
         hidden_states = input_embeds
         residual = None
+        anchor_features = None
+        if self.known_anchor_injection:
+            anchor_features = self.injection.token_features(
+                self.transfer_codebook, input_ids[:: self.injection.block_size]
+            )
         final_pre_injection = hidden_states
         for layer_idx, layer in enumerate(self.layers):
             hidden_states, residual = layer(
@@ -242,7 +251,9 @@ class DSpineQwen3Model(DFlashQwen3Model):
             )
             if layer_idx == len(self.layers) - 1:
                 final_pre_injection = pre_injection
-            post_injection = self.injection(layer_idx, pre_injection)
+            post_injection = self.injection(
+                layer_idx, pre_injection, anchor_features=anchor_features
+            )
             hidden_states = hidden_states + (post_injection - pre_injection)
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states, final_pre_injection
@@ -274,9 +285,12 @@ class DSpineQwen3ForCausalLM(DFlashQwen3ForCausalLM):
     def compute_candidates(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.candidate_logits_processor.get_top_k_tokens(
-            self.lm_head, hidden_states, self.model.transition_top_k
-        )
+        # DSpine currently supports TP=1. Native top-k also avoids requiring
+        # a separately JIT-compiled vocabulary-selection kernel.
+        logits = self.candidate_logits_processor(self.lm_head, hidden_states)
+        assert logits is not None
+        values, ids = torch.topk(logits, self.model.transition_top_k, dim=-1)
+        return ids, values.float()
 
     def compute_transition_scores(
         self,

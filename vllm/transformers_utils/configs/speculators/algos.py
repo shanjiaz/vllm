@@ -155,6 +155,9 @@ def update_dspine(config_dict: dict, pre_trained_config: dict) -> None:
     update_dflash(config_dict, pre_trained_config)
     pre_trained_config["architectures"] = ["DSpineDraftModel"]
     pre_trained_config["dflash_config"]["causal"] = True
+    pre_trained_config["dflash_config"]["known_anchor_injection"] = config_dict.get(
+        "known_anchor_injection", False
+    )
     for key in (
         "block_size",
         "transfer_dim",

@@ -38,12 +38,21 @@ def test_dspine_updater_builds_causal_dflash_contract() -> None:
         "target_layer_ids": [1, 4],
         "sample_from_anchor": False,
         "causal": True,
+        "known_anchor_injection": False,
         "block_size": 4,
         "transfer_dim": 8,
         "message_dim": 6,
         "transition_top_k": 3,
         "transfer_space_eps": 1e-5,
     }
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_dspine_updater_preserves_explicit_anchor_mode(enabled) -> None:
+    source = _dspine_config()
+    source["known_anchor_injection"] = enabled
+    config = SpeculatorsConfig.extract_transformers_pre_trained_config(source)
+    assert config["dflash_config"]["known_anchor_injection"] is enabled
 
 
 def test_dspine_speculative_config_reuses_dflash_runtime() -> None:
